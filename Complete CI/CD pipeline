@@ -1,0 +1,389 @@
+ **AWS monitoring & logging setup from scratch** for EC2 / compute infrastructure.Here's your full setup guide for AWS EC2 monitoring and logging from scratch.
+
+---
+
+## Step 1 — Attach an IAM role to your EC2 instance
+
+Your instance needs permissions to push data to CloudWatch. Create a role with these managed policies and attach it to each EC2 instance:
+
+- `CloudWatchAgentServerPolicy` — lets the agent publish metrics and logs
+- `AmazonSSMReadOnlyAccess` — lets the agent read its config from SSM Parameter Store (recommended)
+
+---
+
+## Step 2 — Install the CloudWatch Agent
+
+SSH into each instance and run:
+
+```bash
+# Amazon Linux 2 / AL2023
+sudo yum install -y amazon-cloudwatch-agent
+
+# Ubuntu / Debian
+wget https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb
+sudo dpkg -i amazon-cloudwatch-agent.deb
+```
+
+---
+
+## Step 3 — Configure the agent
+
+Use the wizard to generate a config (or write one manually):
+
+```bash
+sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-config-wizard
+```
+
+A minimal JSON config covering the most useful metrics and logs:
+
+```json
+{
+  "metrics": {
+    "namespace": "MyApp/EC2",
+    "metrics_collected": {
+      "cpu":    { "measurement": ["cpu_usage_idle", "cpu_usage_user"], "metrics_collection_interval": 60 },
+      "mem":    { "measurement": ["mem_used_percent"], "metrics_collection_interval": 60 },
+      "disk":   { "measurement": ["disk_used_percent"], "resources": ["/"], "metrics_collection_interval": 60 }
+    }
+  },
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          { "file_path": "/var/log/syslog",       "log_group_name": "/ec2/syslog",   "log_stream_name": "{instance_id}" },
+          { "file_path": "/var/log/app/app.log",  "log_group_name": "/ec2/app",      "log_stream_name": "{instance_id}" }
+        ]
+      }
+    }
+  }
+}
+```
+
+Store this in SSM Parameter Store (recommended):
+
+```bash
+aws ssm put-parameter \
+  --name "/cloudwatch-agent/config" \
+  --type "String" \
+  --value file://config.json
+```
+
+Start the agent:
+
+```bash
+sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+  -a fetch-config -m ec2 \
+  -s -c ssm:/cloudwatch-agent/config
+```
+
+---
+
+## Step 4 — Enable CloudTrail
+
+CloudTrail captures every AWS API call (who did what, when).
+
+```bash
+aws cloudtrail create-trail \
+  --name my-trail \
+  --s3-bucket-name my-cloudtrail-bucket \
+  --is-multi-region-trail
+
+aws cloudtrail start-logging --name my-trail
+```
+
+Send CloudTrail logs to CloudWatch Logs for querying:
+
+```bash
+aws cloudtrail update-trail \
+  --name my-trail \
+  --cloud-watch-logs-log-group-arn arn:aws:logs:REGION:ACCOUNT:log-group:/cloudtrail/events:* \
+  --cloud-watch-logs-role-arn arn:aws:iam::ACCOUNT:role/CloudTrailRole
+```
+
+---
+
+## Step 5 — Create CloudWatch Alarms
+
+Set up alarms that trigger SNS notifications:
+
+```bash
+# CPU > 80% for 2 consecutive minutes
+aws cloudwatch put-metric-alarm \
+  --alarm-name "HighCPU" \
+  --metric-name cpu_usage_user \
+  --namespace MyApp/EC2 \
+  --statistic Average \
+  --period 60 \
+  --evaluation-periods 2 \
+  --threshold 80 \
+  --comparison-operator GreaterThanThreshold \
+  --alarm-actions arn:aws:sns:REGION:ACCOUNT:my-alerts-topic
+
+# Disk > 85%
+aws cloudwatch put-metric-alarm \
+  --alarm-name "HighDiskUsage" \
+  --metric-name disk_used_percent \
+  --namespace MyApp/EC2 \
+  --statistic Average \
+  --period 300 \
+  --evaluation-periods 1 \
+  --threshold 85 \
+  --comparison-operator GreaterThanThreshold \
+  --alarm-actions arn:aws:sns:REGION:ACCOUNT:my-alerts-topic
+```
+
+---
+
+## Step 6 — Set log retention policies
+
+By default, CloudWatch log groups never expire and cost money indefinitely. Set a retention policy on each group:
+
+```bash
+aws logs put-retention-policy \
+  --log-group-name /ec2/app \
+  --retention-in-days 30
+```
+
+Typical values: 7 days (dev), 30 days (prod), 90–365 days (compliance).
+
+---
+
+## Key metrics to watch from day one
+
+| What | Metric | Threshold |
+|---|---|---|
+| CPU | `cpu_usage_user` | Alert > 80% |
+| Memory | `mem_used_percent` | Alert > 85% |
+| Disk | `disk_used_percent` | Alert > 85% |
+| Network errors | `net_err_in` / `net_err_out` | Any sustained non-zero |
+| Status checks | `StatusCheckFailed` | Any failure |
+
+---
+
+**Next steps worth considering:** a CloudWatch Dashboard for a visual overview, Logs Insights queries for 
+log analysis, and EventBridge rules if you want automated remediation (e.g. auto-restart a service when an alarm fires). 
+Let me know which you'd like to set up next.
+
+
+Here's a complete **GitHub Actions → AWS EKS automated deployment pipeline** from scratch.Here's everything you need to wire this up end to end.
+
+---
+
+## Step 1 — Prerequisites
+
+Make sure you have these in place before writing any workflow:
+
+- An EKS cluster running (`eksctl` or Terraform)
+- An ECR repository for your Docker image
+- An IAM user or OIDC role for GitHub Actions with these policies:
+  - `AmazonEC2ContainerRegistryPowerUser`
+  - `eks:DescribeCluster`, `eks:UpdateKubeconfig`
+
+Store these as GitHub repository secrets:
+
+| Secret | Value |
+|---|---|
+| `AWS_ACCESS_KEY_ID` | IAM key |
+| `AWS_SECRET_ACCESS_KEY` | IAM secret |
+| `AWS_REGION` | e.g. `ap-south-1` |
+| `ECR_REGISTRY` | e.g. `123456789.dkr.ecr.ap-south-1.amazonaws.com` |
+| `EKS_CLUSTER_NAME` | your cluster name |
+
+> Using OIDC (recommended): you can skip long-lived keys entirely by federating GitHub as an OIDC provider and using `aws-actions/configure-aws-credentials` with a role ARN instead.
+
+---
+
+## Step 2 — The GitHub Actions workflow
+
+Create `.github/workflows/deploy.yml`:
+
+```yaml
+name: Build and deploy to EKS
+
+on:
+  push:
+    branches: [main]
+
+env:
+  IMAGE_NAME: my-app
+  K8S_NAMESPACE: production
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run tests
+        run: |
+          npm ci
+          npm test
+
+  build-and-push:
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image tag
+        id: meta
+        run: echo "tag=${{ secrets.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}" >> $GITHUB_OUTPUT
+
+      - name: Build and push
+        run: |
+          docker build -t ${{ steps.meta.outputs.tag }} .
+          docker push ${{ steps.meta.outputs.tag }}
+
+      - name: Scan image (Trivy)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.meta.outputs.tag }}
+          severity: HIGH,CRITICAL
+          exit-code: 1   # fail the job on critical CVEs
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment: production   # enables manual approval gate if configured
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ secrets.EKS_CLUSTER_NAME }} \
+            --region ${{ secrets.AWS_REGION }}
+
+      - name: Deploy with Helm
+        run: |
+          helm upgrade --install my-app ./helm/my-app \
+            --namespace ${{ env.K8S_NAMESPACE }} \
+            --set image.tag=${{ github.sha }} \
+            --set image.repository=${{ secrets.ECR_REGISTRY }}/my-app \
+            --atomic \
+            --timeout 5m
+```
+
+ rollback trigger — if the rollout fails or pods don't become ready within the timeout, Helm rolls back to the previous release automatically.
+
+---
+
+## Step 3 — Kubernetes manifests (if not using Helm)
+
+If you prefer raw manifests over Helm, use `kustomize` with an image override:
+
+```yaml
+# k8s/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+  namespace: production
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0       # zero-downtime rolling deploy
+  selector:
+    matchLabels:
+      app: my-app
+  template:
+    metadata:
+      labels:
+        app: my-app
+    spec:
+      containers:
+        - name: my-app
+          image: PLACEHOLDER   # replaced by kustomize at deploy time
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 5
+```
+
+Then in the deploy step replace the Helm command with:
+
+```bash
+cd k8s
+kustomize edit set image my-app=${{ steps.meta.outputs.tag }}
+kubectl apply -k .
+kubectl rollout status deployment/my-app -n production --timeout=5m
+```
+
+---
+
+## Step 4 — IAM with OIDC (recommended over long-lived keys)
+
+This avoids storing AWS keys as secrets entirely:
+
+```bash
+# One-time setup: create OIDC provider for GitHub
+eksctl utils associate-iam-oidc-provider \
+  --cluster my-cluster --approve
+
+# Create the role (replace YOUR_GITHUB_ORG/YOUR_REPO)
+aws iam create-role --role-name GitHubActionsEKS \
+  --assume-role-policy-document '{
+    "Version": "2012-10-17",
+    "Statement": [{
+      "Effect": "Allow",
+      "Principal": { "Federated": "arn:aws:iam::ACCOUNT:oidc-provider/token.actions.githubusercontent.com" },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringLike": { "token.actions.githubusercontent.com:sub": "repo:YOUR_GITHUB_ORG/YOUR_REPO:*" }
+      }
+    }]
+  }'
+```
+
+Then in the workflow, swap the credentials step to:
+
+```yaml
+- uses: aws-actions/configure-aws-credentials@v4
+  with:
+    role-to-assume: arn:aws:iam::ACCOUNT:role/GitHubActionsEKS
+    aws-region: ${{ secrets.AWS_REGION }}
+```
+
+And add `permissions: id-token: write` at the job level.
+
+---
+
+## Key things to get right
+
+| Concern | How it's handled |
+|---|---|
+| Zero-downtime deploys | `maxUnavailable: 0` in RollingUpdate |
+| Automatic rollback | `helm upgrade --atomic` or `kubectl rollout undo` |
+| Image immutability | Tag images with `github.sha`, never `latest` |
+| Security scanning | Trivy in CI blocks deploys with critical CVEs |
+| Secrets | GitHub encrypted secrets or OIDC (no long-lived keys) |
+| Manual approval | GitHub Environments with required reviewers |
+
+---
+
+ — Helm chart structure, OIDC setup, blue/green deploys, or adding CloudWatch alerts for failed rollouts?
